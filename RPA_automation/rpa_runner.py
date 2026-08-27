@@ -1,6 +1,7 @@
 """Orquestador del proceso RPA: recorre el dataset y opera el formulario."""
 from __future__ import annotations
 
+import csv
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,7 +33,7 @@ class RecordResult:
 
 
 class PeopleSyncRPARunner:
-    """Abre el navegador una sola vez y procesa los 50 registros del dataset."""
+    """Abre el navegador una sola vez y procesa los registros del dataset."""
 
     def __init__(self, headless: bool = config.HEADLESS_DEFAULT):
         self._headless = headless
@@ -40,9 +41,6 @@ class PeopleSyncRPARunner:
         self._page: Optional[PeopleSyncFormPage] = None
         self._vocab: dict[str, list[str]] = {}
 
-    # ------------------------------------------------------------------ #
-    # Ciclo de vida del navegador
-    # ------------------------------------------------------------------ #
     def _build_driver(self) -> webdriver.Chrome:
         options = Options()
         if self._headless:
@@ -56,8 +54,8 @@ class PeopleSyncRPARunner:
         return webdriver.Chrome(service=service, options=options)
 
     def _load_vocabulary(self) -> None:
-        """Lee del DOM en vivo las opciones validas de cada campo (sin hardcodear listas)."""
-        self._vocab = {
+        """Lee del DOM las opciones válidas limpiando espacios en blanco."""
+        raw_vocab = {
             "genero": self._page.get_select_options(L.GENERO),
             "area": self._page.get_select_options(L.AREA),
             "puesto": self._page.get_select_options(L.PUESTO),
@@ -65,23 +63,25 @@ class PeopleSyncRPARunner:
             "sede": self._page.get_select_options(L.SEDE),
             "modalidad": self._page.get_radio_values(L.MODALIDAD_RADIOS),
         }
-        logger.info("Vocabulario del formulario cargado: %s", {k: len(v) for k, v in self._vocab.items()})
+        # Normalizar omitiendo cadenas vacías y quitando espacios extras
+        self._vocab = {
+            k: [str(opt).strip() for opt in v if str(opt).strip()] 
+            for k, v in raw_vocab.items()
+        }
+        logger.info("Vocabulario cargado: %s", {k: len(v) for k, v in self._vocab.items()})
 
     def _check_compatibility(self, record: EmployeeRecord) -> list[str]:
         errors = []
         for campo in _COMPATIBILITY_FIELDS:
-            valor = getattr(record, campo)
+            valor = str(getattr(record, campo, "")).strip()
             permitidos = self._vocab.get(campo, [])
             if valor not in permitidos:
                 errors.append(
-                    f"El valor '{valor}' del campo '{campo}' no esta entre las opciones "
-                    f"disponibles en el formulario."
+                    f"El valor '{valor}' del campo '{campo}' no está entre las opciones "
+                    f"disponibles {permitidos}."
                 )
         return errors
 
-    # ------------------------------------------------------------------ #
-    # Ejecucion principal
-    # ------------------------------------------------------------------ #
     def run(self) -> list[RecordResult]:
         records = DatasetLoader(config.DATASET_CSV_URL).load()
         logger.info("Dataset cargado: %d registros.", len(records))
@@ -90,7 +90,7 @@ class PeopleSyncRPARunner:
         self._driver = self._build_driver()
         try:
             self._page = PeopleSyncFormPage(self._driver)
-            self._page.open()  # unica carga completa de la pagina
+            self._page.open()
             self._load_vocabulary()
 
             for record in records:
@@ -107,64 +107,58 @@ class PeopleSyncRPARunner:
         format_errors = record.validate()
         if format_errors:
             motivo = " | ".join(format_errors)
-            logger.warning("Registro %s omitido (datos inconsistentes): %s", record.record_id, motivo)
+            logger.warning("Registro %s omitido (inconsistente): %s", record.record_id, motivo)
             return RecordResult(**base, status="FALLIDO", motivo=motivo)
 
         compat_errors = self._check_compatibility(record)
         if compat_errors:
             motivo = " | ".join(compat_errors)
-            logger.warning("Registro %s omitido (incompatible con el formulario): %s", record.record_id, motivo)
+            logger.warning("Registro %s omitido (incompatible): %s", record.record_id, motivo)
             return RecordResult(**base, status="FALLIDO", motivo=motivo)
 
         try:
             self._page.fill_record(record)
             outcome = self._page.submit_and_verify(record.dni)
+            
+            # Garantizar la limpieza del formulario tras cada intento
+            self._safe_reset()
+
             if outcome.success:
-                logger.info(
-                    "Registro %s cargado con exito (total acumulado: %s).",
-                    record.record_id, outcome.total_registros,
-                )
+                logger.info("Registro %s cargado con éxito.", record.record_id)
                 return RecordResult(**base, status="EXITO")
 
-            logger.warning("Registro %s fallo al enviarse: %s", record.record_id, outcome.reason)
+            logger.warning("Registro %s falló al enviarse: %s", record.record_id, outcome.reason)
+            return RecordResult(**base, status="FALLIDO", motivo=outcome.reason or "Fallo no especificado.")
+        except Exception as exc:
+            logger.exception("Error inesperado en registro %s", record.record_id)
             self._safe_reset()
-            return RecordResult(**base, status="FALLIDO", motivo=outcome.reason or "Fallo no especificado en el envio.")
-        except Exception as exc:  # noqa: BLE001 - no debe detener el lote por un fallo individual
-            logger.exception("Error inesperado procesando el registro %s", record.record_id)
-            self._safe_reset()
-            return RecordResult(**base, status="FALLIDO", motivo=f"Error inesperado durante el llenado/envio: {exc}")
+            return RecordResult(**base, status="FALLIDO", motivo=f"Error inesperado: {exc}")
 
     def _safe_reset(self) -> None:
         try:
             self._page.reset_form()
         except Exception:
-            logger.exception("No se pudo limpiar el formulario tras un fallo; se continua de todas formas.")
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    runner = PeopleSyncRPARunner(headless=False)
-    results = runner.run()
-import csv
+            logger.exception("No se pudo limpiar el formulario; se continúa.")
+
 
 if __name__ == "__main__":
-    # 1. Guardar todos los logs en un archivo de texto 'ejecucion_rpa.log'
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler("ejecucion_rpa.log", encoding="utf-8"), # Archivo guardado
-            logging.StreamHandler()                                     # Salida en consola
+            logging.FileHandler("ejecucion_rpa.log", encoding="utf-8"),
+            logging.StreamHandler()
         ]
     )
 
     runner = PeopleSyncRPARunner(headless=False)
     resultados = runner.run()
 
-    # 2. Exportar la tabla de resultados a 'reporte_resultados.csv'
     with open("reporte_resultados.csv", mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Fila", "DNI", "Apellidos y Nombres", "Estado", "Motivo", "Timestamp"])
         for r in resultados:
             writer.writerow([r.row_number, r.dni, r.apellidos_nombres, r.status, r.motivo, r.timestamp])
 
-    print("\nArchivos 'ejecucion_rpa.log' y 'reporte_resultados.csv' generados con éxito.")
-
+    print("\nEjecución finalizada. 'ejecucion_rpa.log' y 'reporte_resultados.csv' generados.")
+    
