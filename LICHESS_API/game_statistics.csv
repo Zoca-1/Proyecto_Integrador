@@ -1,0 +1,7 @@
+metric,key,value
+result_count,Draw,16.0
+result_count,Loss,42.0
+result_count,Win,142.0
+win_rate_by_speed,blitz,0.85
+win_rate_by_speed,bullet,0.6983240223463687
+win_rate_by_speed,correspondence,0.0
